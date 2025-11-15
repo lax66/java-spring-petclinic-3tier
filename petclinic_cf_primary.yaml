@@ -1,0 +1,504 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PetClinic full stack (VPC, ALB, ASG, RDS) using Ubuntu launch template + bastion host + Route53 DB CNAME for DR.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Key pair for EC2 instance SSH (for troubleshooting)
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for app servers
+
+  SSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed for SSH (lab only - restrict in production)
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Master DB password (NoEcho)
+
+  JarS3Bucket:
+    Type: String
+    Description: S3 bucket where spring-petclinic.jar is stored
+
+  JarS3Key:
+    Type: String
+    Default: spring-petclinic.jar
+    Description: S3 object name for the jar
+
+  EnvTag:
+    Type: String
+    Default: primary
+    Description: Tag to identify environment (primary/standby)
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: VPC CIDR block
+
+  UbuntuAmiId:
+    Type: String
+    Description: "Ubuntu AMI ID for this region"
+
+  HostedZoneId:
+    Type: String
+    Default: Z00823431PBITGHPMDK3D
+    Description: "Public Route53 Hosted Zone ID for devopsdock.site"
+
+
+Resources:
+  # --------------------------
+  # VPC + NETWORK
+  # --------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-vpc-${EnvTag}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-igw-${EnvTag}
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-public-1-${EnvTag}
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-public-2-${EnvTag}
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-private-1-${EnvTag}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-private-2-${EnvTag}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-public-rt-${EnvTag}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-nat-${EnvTag}
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-private-rt-${EnvTag}
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # --------------------------
+  # SECURITY GROUPS
+  # --------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-alb-sg-${EnvTag}
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH to bastion
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHCidr
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-bastion-sg-${EnvTag}
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow app port from ALB and SSH/app from Bastion
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # ALB → 8080
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+        # Bastion → SSH
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+
+        # Bastion → 8080 (direct app access)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-app-sg-${EnvTag}
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from app & bastion
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # App → DB
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+        # Bastion → DB
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-rds-sg-${EnvTag}
+
+  # --------------------------
+  # BASTION HOST
+  # --------------------------
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-bastion-${EnvTag}
+
+  # --------------------------
+  # RDS + SUBNET GROUP
+  # --------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for PetClinic RDS"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      DBSubnetGroupName: !Sub petclinic-db-subnet-${EnvTag}
+
+  PetclinicDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub petclinic-db-${EnvTag}
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: "8.0"
+      MasterUsername: petuser
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-db-${EnvTag}
+
+  # --------------------------
+  # ROUTE53 DB RECORD (CNAME)
+  # --------------------------
+  DBRoute53Record:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: dbpetclinic.devopsdock.site.
+      Type: CNAME
+      TTL: 60
+      ResourceRecords:
+        - !GetAtt PetclinicDB.Endpoint.Address
+
+  # --------------------------
+  # IAM ROLE FOR EC2
+  # --------------------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: "/"
+      Policies:
+        - PolicyName: S3ReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${JarS3Bucket}/*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # --------------------------
+  # ALB + TG + LISTENER
+  # --------------------------
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub petclinic-alb-${EnvTag}
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Scheme: internet-facing
+      Type: application
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-alb-${EnvTag}
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub petclinic-tg-${EnvTag}
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /actuator/health
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  # --------------------------
+  # LAUNCH TEMPLATE (UPDATED DB DNS)
+  # --------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub petclinic-lt-${EnvTag}
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        ImageId: !Ref UbuntuAmiId
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        KeyName: !Ref KeyName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            apt-get update -y
+            apt-get upgrade -y
+            apt-get install -y openjdk-25-jdk-headless curl unzip
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.30.6.zip" -o "awscliv2.zip"
+            sudo apt install -y unzip
+            unzip awscliv2.zip
+            sudo ./aws/install
+
+            aws s3 cp s3://${JarS3Bucket}/${JarS3Key} /home/ubuntu/app.jar
+            sudo chown ubuntu:ubuntu /home/ubuntu/app.jar
+
+            # Use Route53 DNS instead of RDS endpoint
+            export SPRING_PROFILES_ACTIVE=mysql
+            export SPRING_DATASOURCE_URL=jdbc:mysql://dbpetclinic.devopsdock.site:3306/petclinic?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
+            export SPRING_DATASOURCE_USERNAME=petuser
+            export SPRING_DATASOURCE_PASSWORD=PetPass123!
+
+            sudo bash -c 'cat > /etc/systemd/system/petclinic.service <<EOF
+            [Unit]
+            Description=PetClinic Spring Boot App
+            After=network.target
+
+            [Service]
+            User=ubuntu
+            Environment=SPRING_PROFILES_ACTIVE=mysql
+            Environment=SPRING_DATASOURCE_URL=jdbc:mysql://dbpetclinic.devopsdock.site:3306/petclinic?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
+            Environment=SPRING_DATASOURCE_USERNAME=petuser
+            Environment=SPRING_DATASOURCE_PASSWORD=PetPass123!
+            ExecStart=/usr/bin/java -jar /home/ubuntu/app.jar
+            SuccessExitStatus=143
+            Restart=on-failure
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF'
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable petclinic
+            sudo systemctl start petclinic
+
+  # --------------------------
+  # AUTOSCALING GROUP
+  # --------------------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - NatGateway
+      - PrivateDefaultRoute
+    Properties:
+      AutoScalingGroupName: !Sub petclinic-asg-${EnvTag}
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub petclinic-asg-${EnvTag}
+          PropagateAtLaunch: true
+
+
+Outputs:
+  ALBDNS:
+    Description: "Load Balancer DNS"
+    Value: !GetAtt AppLoadBalancer.DNSName
+    Export:
+      Name: !Sub petclinic-alb-dns-${EnvTag}-${AWS::Region}
+
+  DBEndpoint:
+    Description: "RDS endpoint"
+    Value: !GetAtt PetclinicDB.Endpoint.Address
+
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+    Description: "ASG name"
+    
